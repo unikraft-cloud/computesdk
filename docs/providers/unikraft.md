@@ -61,7 +61,7 @@ const sandbox2 = await compute.instances.create({
   vcpus: 2,
 });
 
-// Or clone an instance template
+// Or resume an instance template or a checkpoint
 const sandbox3 = await compute.instances.create({ snapshotId: 'my-template' });
 
 // Run a command
@@ -86,6 +86,11 @@ interface UnikraftConfig {
   metro?: string;
   /** Image for a sandbox whose create call names none. If absent, the provider reads `UKC_SANDBOX_IMAGE`. */
   image?: string;
+  /**
+   * Instance template or checkpoint, by UUID or by name, for a sandbox whose create call names no source.
+   * If absent, and `image` is absent too, the provider reads `UKC_SANDBOX_SNAPSHOT`.
+   */
+  snapshot?: string;
   /** Sandbox plugin ROM. If absent, the provider reads `UKC_SANDBOX_ROM`. */
   rom?: string;
   /** Memory for each sandbox, in MiB, if the create call names none. */
@@ -101,7 +106,7 @@ interface UnikraftConfig {
 
 - **Metro.** A metro is one Unikraft Cloud data center, for example `fra` or `was`. A sandbox lives in one metro, and its ID resolves in no other.
 - **Image.** A sandbox boots from a container image. The default is `debian-slim:latest`. Push your own image to the Unikraft Cloud registry and name it as `my-org/name:tag`.
-- **Template.** An instance template is a saved sandbox. `snapshotId` clones one by UUID or by name. The clone takes the image, the size, and the plugin of the template, so do not pass `image`, `memoryMb`, or `vcpus` with it.
+- **Snapshot.** An instance template or a checkpoint is a saved running sandbox. A sandbox from a snapshot resumes its memory, so it does not boot, and it is the fastest way to create a sandbox. `snapshotId` names a template or a checkpoint by UUID or by name, and `templateId` names a template. Without either, the provider uses `snapshot` from the config or `UKC_SANDBOX_SNAPSHOT`. The sandbox takes the image, the size, and the plugin of the snapshot, so do not pass `image`, `memoryMb`, or `vcpus` with it. The script `scripts/make-snapshot.mts` in the package makes a snapshot and prints its UUID.
 
 ### Limitations
 
