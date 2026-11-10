@@ -60,6 +60,8 @@ const sandbox = await sdk.instances.create({ image: 'my-org/sandbox-base:latest'
 | `UKC_SANDBOX_IMAGE` | Image for a sandbox whose create call names none. |
 | `UKC_SANDBOX_SNAPSHOT` | Instance template or checkpoint, by UUID or by name, for a sandbox whose create call names no source. The provider uses it only when the config sets neither `snapshot` nor `image`, and it comes before `UKC_SANDBOX_IMAGE`. |
 | `UKC_SANDBOX_ROM` | Sandbox plugin ROM, for example `plugins/sandbox:1.2.0`. The default is `plugins/sandbox:latest`, the default of the Unikraft Cloud SDK. |
+| `UKC_HTTP2` | Offer HTTP/2 to the API host. Off by default; `1` turns it on. |
+| `UKC_MAX_CONNECTIONS` | The most connections the SDK opens to the API host at once. No cap by default. Set it only for a host that answers HTTP/2: a host on HTTP/1.1 runs at most this many requests at once. |
 
 ### Configuration options
 

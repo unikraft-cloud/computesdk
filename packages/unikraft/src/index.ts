@@ -48,6 +48,17 @@ export interface UnikraftConfig {
   vcpus?: number
   /** Default `runCommand` timeout, in milliseconds. Without it a command runs until it exits. */
   timeout?: number
+  /**
+   * Offer HTTP/2 to the API host. Off by default; `UKC_HTTP2=1` turns it on
+   * when the config does not set it.
+   */
+  http2?: boolean
+  /**
+   * The most connections the SDK opens to the API host at once. No cap by
+   * default; `UKC_MAX_CONNECTIONS` sets one when the config does not. Set it
+   * only for a host that answers HTTP/2.
+   */
+  maxConnections?: number
 }
 
 // `timeout(1)` exits with 124 when it stops a command, so callers that check
@@ -80,6 +91,25 @@ function env(name: string): string | undefined {
   return value === undefined || value === '' ? undefined : value
 }
 
+function flag(name: string): boolean | undefined {
+  const value = env(name)
+  if (value === undefined) return undefined
+  return !['0', 'false', 'no', 'off'].includes(value.toLowerCase())
+}
+
+function count(name: string): number | undefined {
+  const value = env(name)
+  if (value === undefined) return undefined
+  const n = Number(value)
+  return Number.isInteger(n) && n >= 0 ? n : undefined
+}
+
+// A burst of sandbox creates from one process opens one TLS connection per
+// request on HTTP/1.1, and Node runs every handshake on its one thread. With
+// HTTP/2 the same burst shares a few connections. Both stay off here, because
+// a host that answers only HTTP/1.1 runs at most `maxConnections` requests at
+// once under a cap; a caller on an HTTP/2 host turns them on.
+
 function getClient(config: UnikraftConfig): MetroClient {
   const token = config.token ?? env('UKC_TOKEN')
   if (!token) {
@@ -91,12 +121,19 @@ function getClient(config: UnikraftConfig): MetroClient {
     )
   }
   const metro = config.metro ?? env('UKC_METRO') ?? DEFAULT_METRO
-  const key = JSON.stringify([token, metro])
+  const http2 = config.http2 ?? flag('UKC_HTTP2') ?? false
+  const maxConnections = config.maxConnections ?? count('UKC_MAX_CONNECTIONS') ?? 0
+  const key = JSON.stringify([token, metro, http2, maxConnections])
   let client = clients.get(key)
   if (!client) {
     // A URL as the metro pins the client to that deployment, and `metro()`
     // then returns that deployment for any code it gets.
-    client = new UnikraftCloud({ token, metro }).metro(metro)
+    client = new UnikraftCloud({
+      token,
+      metro,
+      http2,
+      maxConnections: maxConnections > 0 ? maxConnections : undefined,
+    }).metro(metro)
     clients.set(key, client)
   }
   return client
