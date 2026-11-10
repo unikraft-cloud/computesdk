@@ -58,7 +58,10 @@ const sandbox = await sdk.instances.create({ image: 'my-org/sandbox-base:latest'
 | `UKC_TOKEN` | API token. Required unless you pass `token`. |
 | `UKC_METRO` | Metro code, for example `fra`, or the full API URL of a deployment. |
 | `UKC_SANDBOX_IMAGE` | Image for a sandbox whose create call names none. |
+| `UKC_SANDBOX_SNAPSHOT` | Instance template or checkpoint, by UUID or by name, for a sandbox whose create call names no source. The provider uses it only when the config sets neither `snapshot` nor `image`, and it comes before `UKC_SANDBOX_IMAGE`. |
 | `UKC_SANDBOX_ROM` | Sandbox plugin ROM, for example `plugins/sandbox:1.2.0`. The default is `plugins/sandbox:latest`, the default of the Unikraft Cloud SDK. |
+| `UKC_HTTP2` | Offer HTTP/2 to the API host. Off by default; `1` turns it on. |
+| `UKC_MAX_CONNECTIONS` | The most connections the SDK opens to the API host at once. No cap by default. Set it only for a host that answers HTTP/2: a host on HTTP/1.1 runs at most this many requests at once. |
 
 ### Configuration options
 
@@ -70,6 +73,11 @@ interface UnikraftConfig {
   metro?: string;
   /** Image for a sandbox whose create call names none. If absent, the provider reads `UKC_SANDBOX_IMAGE`. */
   image?: string;
+  /**
+   * Instance template or checkpoint, by UUID or by name, for a sandbox whose create call names no source.
+   * If absent, and `image` is absent too, the provider reads `UKC_SANDBOX_SNAPSHOT`.
+   */
+  snapshot?: string;
   /** Sandbox plugin ROM. If absent, the provider reads `UKC_SANDBOX_ROM`. */
   rom?: string;
   /** Memory for each sandbox, in MiB, if the create call names none. */
@@ -92,17 +100,33 @@ const sandbox = await sdk.instances.create({
   name: 'build-42',
 });
 
-// Clone an instance template instead of booting an image.
+// Resume a snapshot instead of booting an image.
 const clone = await sdk.instances.create({ snapshotId: 'my-template' });
 ```
 
-`snapshotId` names an instance template by UUID or by name. The clone takes the image, the size, and the plugin of the template, so do not pass `image`, `memoryMb`, or `vcpus` with it.
+`snapshotId` names an instance template or a checkpoint, by UUID or by name. `templateId` names an instance template. A sandbox from a snapshot takes the image, the size, and the plugin of the snapshot, so do not pass `image`, `memoryMb`, or `vcpus` with it.
+
+The provider tries `snapshotId` as an instance template first. If the platform refuses it, the provider asks the platform if the ID names a checkpoint, and if it does, creates the sandbox from the checkpoint. The provider remembers which kind each ID is, so these extra requests occur only once for each ID.
+
+### Snapshots
+
+A sandbox from a snapshot resumes the memory of a running sandbox, so it does not boot, and its first command runs from memory. This is the fastest way to create a sandbox. The provider does not wait for the sandbox plugin before it returns such a sandbox, because the platform holds the first plugin request until the plugin is ready.
+
+To make a snapshot, run the script in this package once on each metro. It creates a sandbox from an image, runs one command in it, saves the sandbox as an instance template, and prints its UUID:
+
+```bash
+UKC_TOKEN=... UKC_METRO=fra \
+  node --experimental-strip-types scripts/make-snapshot.mts \
+  --image my-org/sandbox-base:latest --memory 512
+```
+
+Pass `--kind checkpoint` to save a checkpoint instead. The snapshot has no autokill, so delete it when you no longer need it. Then set `UKC_SANDBOX_SNAPSHOT` to the UUID, or pass it as `snapshot` or `snapshotId`.
 
 ## Features
 
 - Command execution with `cwd`, `env`, `timeout`, and `background`
 - Filesystem access: `readFile`, `writeFile`, and `mkdir` use the file API of the sandbox plugin; `readdir`, `exists`, and `remove` run shell commands
-- Instance templates through `snapshotId`
+- Instance templates and checkpoints through `snapshotId`, `templateId`, `snapshot`, and `UKC_SANDBOX_SNAPSHOT`
 - `getInstance()` returns the `Sandbox` object of `@unikraft/cloud`, which gives you the full platform API
 
 ## Limitations

@@ -16,7 +16,7 @@ import type {
   RunCommandOptions,
   VolumeMount,
 } from '@computesdk/provider'
-import { DEFAULT_METRO, UnikraftCloud, UnikraftCloudError } from '@unikraft/cloud'
+import { DEFAULT_BOOT_TIMEOUT_S, DEFAULT_METRO, UnikraftCloud, UnikraftCloudError } from '@unikraft/cloud'
 import type { MetroClient, Sandbox, SandboxSpec } from '@unikraft/cloud'
 
 export interface UnikraftConfig {
@@ -33,6 +33,13 @@ export interface UnikraftConfig {
    * reads `UKC_SANDBOX_IMAGE`, then uses the default image of `@unikraft/cloud`.
    */
   image?: string
+  /**
+   * Snapshot for a sandbox whose create call names no source: an instance
+   * template or a checkpoint, by UUID or by name. A sandbox from a snapshot
+   * resumes the memory of a running sandbox, so it does not boot. If absent,
+   * and `image` is absent too, the provider reads `UKC_SANDBOX_SNAPSHOT`.
+   */
+  snapshot?: string
   /** Sandbox plugin ROM. If absent, the provider reads `UKC_SANDBOX_ROM`, then uses the default ROM. */
   rom?: string
   /** Memory for each sandbox, in MiB, if the create call names none. */
@@ -41,6 +48,17 @@ export interface UnikraftConfig {
   vcpus?: number
   /** Default `runCommand` timeout, in milliseconds. Without it a command runs until it exits. */
   timeout?: number
+  /**
+   * Offer HTTP/2 to the API host. Off by default; `UKC_HTTP2=1` turns it on
+   * when the config does not set it.
+   */
+  http2?: boolean
+  /**
+   * The most connections the SDK opens to the API host at once. No cap by
+   * default; `UKC_MAX_CONNECTIONS` sets one when the config does not. Set it
+   * only for a host that answers HTTP/2.
+   */
+  maxConnections?: number
 }
 
 // `timeout(1)` exits with 124 when it stops a command, so callers that check
@@ -60,6 +78,8 @@ const BASE_ENV: Record<string, string> = { HOME: '/root' }
 interface SandboxState {
   config: UnikraftConfig
   env: Record<string, string>
+  /** The create skipped the readiness probe, and no plugin call has succeeded yet. */
+  unprobed: boolean
 }
 
 // `Sandbox` holds neither the provider config nor the create options, so the
@@ -70,6 +90,25 @@ function env(name: string): string | undefined {
   const value = process.env[name]
   return value === undefined || value === '' ? undefined : value
 }
+
+function flag(name: string): boolean | undefined {
+  const value = env(name)
+  if (value === undefined) return undefined
+  return !['0', 'false', 'no', 'off'].includes(value.toLowerCase())
+}
+
+function count(name: string): number | undefined {
+  const value = env(name)
+  if (value === undefined) return undefined
+  const n = Number(value)
+  return Number.isInteger(n) && n >= 0 ? n : undefined
+}
+
+// A burst of sandbox creates from one process opens one TLS connection per
+// request on HTTP/1.1, and Node runs every handshake on its one thread. With
+// HTTP/2 the same burst shares a few connections. Both stay off here, because
+// a host that answers only HTTP/1.1 runs at most `maxConnections` requests at
+// once under a cap; a caller on an HTTP/2 host turns them on.
 
 function getClient(config: UnikraftConfig): MetroClient {
   const token = config.token ?? env('UKC_TOKEN')
@@ -82,24 +121,65 @@ function getClient(config: UnikraftConfig): MetroClient {
     )
   }
   const metro = config.metro ?? env('UKC_METRO') ?? DEFAULT_METRO
-  const key = JSON.stringify([token, metro])
+  const http2 = config.http2 ?? flag('UKC_HTTP2') ?? false
+  const maxConnections = config.maxConnections ?? count('UKC_MAX_CONNECTIONS') ?? 0
+  const key = JSON.stringify([token, metro, http2, maxConnections])
   let client = clients.get(key)
   if (!client) {
     // A URL as the metro pins the client to that deployment, and `metro()`
     // then returns that deployment for any code it gets.
-    client = new UnikraftCloud({ token, metro }).metro(metro)
+    client = new UnikraftCloud({
+      token,
+      metro,
+      http2,
+      maxConnections: maxConnections > 0 ? maxConnections : undefined,
+    }).metro(metro)
     clients.set(key, client)
   }
   return client
 }
 
-function remember(sandbox: Sandbox, config: UnikraftConfig, envs?: Record<string, string>): Sandbox {
-  sandboxState.set(sandbox, { config, env: { ...BASE_ENV, ...envs } })
+function remember(
+  sandbox: Sandbox,
+  config: UnikraftConfig,
+  envs?: Record<string, string>,
+  unprobed = false,
+): Sandbox {
+  sandboxState.set(sandbox, { config, env: { ...BASE_ENV, ...envs }, unprobed })
   return sandbox
 }
 
 function isNotFound(err: unknown): boolean {
   return err instanceof UnikraftCloudError && err.status === 404
+}
+
+// The statuses that `sandbox.ready()` probes again for: the platform has no
+// plugin to forward to yet. Any other failure is the answer of the plugin.
+const NOT_READY_STATUSES = new Set([404, 502, 503, 504])
+
+function isNotReady(err: unknown): boolean {
+  if (!(err instanceof UnikraftCloudError)) return false
+  return err.kind === 'network' || (err.status !== undefined && NOT_READY_STATUSES.has(err.status))
+}
+
+// A sandbox from a snapshot skips the readiness probe, because the platform
+// holds each plugin request until the plugin in the sandbox listens. If the
+// first plugin call still finds no plugin, that call waits for the probe and
+// runs again. A request that got one of these
+// errors did not reach the plugin, so the second run does not repeat a command.
+async function whenReady<T>(sandbox: Sandbox, call: () => Promise<T>): Promise<T> {
+  const state = sandboxState.get(sandbox)
+  if (!state?.unprobed) return call()
+  try {
+    const result = await call()
+    state.unprobed = false
+    return result
+  } catch (err) {
+    if (!isNotReady(err)) throw err
+    await sandbox.ready()
+    state.unprobed = false
+    return call()
+  }
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -123,24 +203,107 @@ function toVolume(mount: VolumeMount): PlatformVolume {
   }
 }
 
-function toSpec(config: UnikraftConfig, options: CreateInstanceOptions = {}): SandboxSpec {
-  const common = {
+function toRef(id: string): { uuid: string } | { name: string } {
+  return UUID.test(id) ? { uuid: id } : { name: id }
+}
+
+type SnapshotKind = 'template' | 'checkpoint'
+
+/** Where a sandbox comes from: a snapshot of a known or an unknown kind, or an image. */
+type Source =
+  | { snapshot: string; kind?: SnapshotKind }
+  | { image: SandboxSpec }
+
+// A ComputeSDK snapshot ID does not say if it names an instance template or a
+// checkpoint, and the platform takes each one in its own field. The provider
+// tries a template first, and asks the checkpoint endpoint only when the
+// platform refuses the template. It keeps the kind it finds, so each ID costs
+// the extra requests once for each client.
+const snapshotKinds = new WeakMap<MetroClient, Map<string, SnapshotKind>>()
+
+function kindsOf(client: MetroClient): Map<string, SnapshotKind> {
+  let kinds = snapshotKinds.get(client)
+  if (!kinds) {
+    kinds = new Map()
+    snapshotKinds.set(client, kinds)
+  }
+  return kinds
+}
+
+// A source that the create call names comes first. Without one, a source in
+// the provider config comes before one in the environment, and a snapshot
+// comes before an image from the same place.
+function toSource(config: UnikraftConfig, options: CreateInstanceOptions = {}): Source {
+  if (options.snapshotId) return { snapshot: options.snapshotId }
+  if (options.templateId) return { snapshot: options.templateId, kind: 'template' }
+  if (!options.image) {
+    const snapshot = config.snapshot ?? (config.image ? undefined : env('UKC_SANDBOX_SNAPSHOT'))
+    if (snapshot) return { snapshot }
+  }
+  return { image: toSpec(config, options) }
+}
+
+// The fields that every source takes. A sandbox from a snapshot takes the
+// image, the size and the plugin of the snapshot, and the platform refuses a
+// create that names them again.
+function commonSpec(options: CreateInstanceOptions = {}): SandboxSpec {
+  return {
     ...(options.envs ? { env: options.envs } : {}),
     ...(options.name ? { name: options.name } : {}),
   }
-  const snapshot = options.snapshotId
-  if (snapshot) {
-    // A clone of an instance template resumes the template's memory, so it
-    // takes the image, the size and the plugin of the template. The platform
-    // refuses a create that names them again.
-    return { ...common, template: UUID.test(snapshot) ? { uuid: snapshot } : { name: snapshot } }
+}
+
+async function createFromSnapshot(
+  client: MetroClient,
+  source: { snapshot: string; kind?: SnapshotKind },
+  options: CreateInstanceOptions = {},
+): Promise<Sandbox> {
+  const kinds = kindsOf(client)
+  const known = source.kind ?? kinds.get(source.snapshot)
+  const ref = toRef(source.snapshot)
+  const create = (kind: SnapshotKind) =>
+    client.sandboxes.create(
+      { ...commonSpec(options), [kind]: ref },
+      {
+        ...(options.signal ? { signal: options.signal } : {}),
+        // The create still waits for the instance to run, so a snapshot that
+        // cannot be restored fails here and not on the first command.
+        bootTimeoutSeconds: DEFAULT_BOOT_TIMEOUT_S,
+        ready: false,
+      },
+    )
+  if (known) return create(known)
+  try {
+    const sandbox = await create('template')
+    kinds.set(source.snapshot, 'template')
+    return sandbox
+  } catch (err) {
+    if (options.signal?.aborted || !(await isCheckpoint(client, source.snapshot))) throw err
+    kinds.set(source.snapshot, 'checkpoint')
+    return create('checkpoint')
   }
-  const image = options.image ?? options.templateId ?? config.image
+}
+
+// The instance endpoints do not find a checkpoint whose source instance is
+// gone, so the provider asks the checkpoint endpoint.
+async function isCheckpoint(client: MetroClient, id: string): Promise<boolean> {
+  try {
+    const res = await client.api.platform.instances.getCheckpointInstances(
+      UUID.test(id) ? { uuid: [id] } : { name: [id] },
+    )
+    return res.data?.instances?.[0]?.state === 'checkpoint'
+  } catch {
+    return false
+  }
+}
+
+function toSpec(config: UnikraftConfig, options: CreateInstanceOptions = {}): SandboxSpec {
+  const image = options.image ?? config.image
   const rom = config.rom ?? env('UKC_SANDBOX_ROM')
   const memory = options.memory_mb ?? options.memoryMb ?? config.memoryMb
   const vcpus = options.vcpus ?? config.vcpus
   return {
-    ...common,
+    ...commonSpec(options),
     ...(image ? { image } : {}),
     ...(rom ? { rom } : {}),
     ...(typeof memory === 'number' ? { memory_mb: memory } : {}),
@@ -178,18 +341,20 @@ async function runCommand(
   }
 
   if (options.background) {
-    await sandbox.start(command, commandOptions)
+    await whenReady(sandbox, () => sandbox.start(command, commandOptions))
     return { stdout: '', stderr: '', exitCode: 0, durationMs: Date.now() - startTime }
   }
 
   const timeout = options.timeout ?? state?.config.timeout
   // `keep` saves the delete request inside the caller's wait. The record is
   // deleted after the result is returned.
-  const result = await sandbox.exec(command, {
-    ...commandOptions,
-    ...(timeout === undefined ? {} : { timeoutSeconds: timeout / 1000 }),
-    keep: true,
-  })
+  const result = await whenReady(sandbox, () =>
+    sandbox.exec(command, {
+      ...commandOptions,
+      ...(timeout === undefined ? {} : { timeoutSeconds: timeout / 1000 }),
+      keep: true,
+    }),
+  )
   const handle = sandbox.command(result.uuid)
   if (result.exitcode === null) {
     // The plugin keeps a command running after a wait times out, so stop it.
@@ -224,8 +389,14 @@ export const unikraft = defineProvider<Sandbox, UnikraftConfig>({
   methods: {
     instances: {
       create: async (config: UnikraftConfig, options?: CreateInstanceOptions) => {
-        const sandbox = await getClient(config).sandboxes.create(
-          toSpec(config, options),
+        const client = getClient(config)
+        const source = toSource(config, options)
+        if ('snapshot' in source) {
+          const sandbox = await createFromSnapshot(client, source, options)
+          return { instance: remember(sandbox, config, options?.envs, true), instanceId: sandbox.uuid }
+        }
+        const sandbox = await client.sandboxes.create(
+          source.image,
           options?.signal ? { signal: options.signal } : {},
         )
         return { instance: remember(sandbox, config, options?.envs), instanceId: sandbox.uuid }
@@ -295,15 +466,15 @@ export const unikraft = defineProvider<Sandbox, UnikraftConfig>({
 
       filesystem: {
         readFile: async (sandbox: Sandbox, path: string): Promise<string> => {
-          return new TextDecoder().decode(await sandbox.readFile(path))
+          return new TextDecoder().decode(await whenReady(sandbox, () => sandbox.readFile(path)))
         },
 
         writeFile: async (sandbox: Sandbox, path: string, content: string): Promise<void> => {
-          await sandbox.writeFile(path, content)
+          await whenReady(sandbox, () => sandbox.writeFile(path, content))
         },
 
         mkdir: async (sandbox: Sandbox, path: string): Promise<void> => {
-          await sandbox.mkdir(path)
+          await whenReady(sandbox, () => sandbox.mkdir(path))
         },
 
         readdir: async (sandbox: Sandbox, path: string, run: FsRunCommand): Promise<FileEntry[]> => {
