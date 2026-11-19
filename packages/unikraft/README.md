@@ -104,6 +104,8 @@ const sandbox = await sdk.instances.create({
 const clone = await sdk.instances.create({ snapshotId: 'my-template' });
 ```
 
+Without a `name`, the provider names the sandbox `sandbox-<random>-<count>`, so creates that start at the same time do not get the same name.
+
 `snapshotId` names an instance template or a checkpoint, by UUID or by name. `templateId` names an instance template. A sandbox from a snapshot takes the image, the size, and the plugin of the snapshot, so do not pass `image`, `memoryMb`, or `vcpus` with it.
 
 The provider tries `snapshotId` as an instance template first. If the platform refuses it, the provider asks the platform if the ID names a checkpoint, and if it does, creates the sandbox from the checkpoint. The provider remembers which kind each ID is, so these extra requests occur only once for each ID.

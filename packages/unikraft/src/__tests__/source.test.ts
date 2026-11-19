@@ -81,6 +81,20 @@ describe('unikraft sandbox.create source', () => {
     expect(opts.ready).toBe(fromSnapshot ? false : undefined)
   })
 
+  it('names each sandbox that the call does not name', async () => {
+    const create = vi.fn(async (_spec: Record<string, unknown>) => fakeSandbox())
+    platform.create = create
+    const provider = unikraft(config({ snapshot: 'tpl' }))
+    await provider.sandbox.create()
+    await provider.sandbox.create()
+    await provider.sandbox.create({ name: 'build-42' })
+
+    const names = create.mock.calls.map(([spec]) => spec.name)
+    expect(names[0]).toMatch(/^sandbox-[0-9a-f]{8}-/)
+    expect(names[1]).not.toBe(names[0])
+    expect(names[2]).toBe('build-42')
+  })
+
   it('creates from a checkpoint after the platform refuses it as a template, and remembers the kind', async () => {
     const create = vi.fn(async (spec: Record<string, unknown>) => {
       if ('template' in spec) throw new UnikraftCloudError('No instance template', { kind: 'http', status: 400 })

@@ -16,6 +16,7 @@ import type {
   RunCommandOptions,
   VolumeMount,
 } from '@computesdk/provider'
+import { randomBytes } from 'node:crypto'
 import { DEFAULT_BOOT_TIMEOUT_S, DEFAULT_METRO, UnikraftCloud, UnikraftCloudError } from '@unikraft/cloud'
 import type { MetroClient, Sandbox, SandboxSpec } from '@unikraft/cloud'
 
@@ -249,8 +250,19 @@ function toSource(config: UnikraftConfig, options: CreateInstanceOptions = {}): 
 function commonSpec(options: CreateInstanceOptions = {}): SandboxSpec {
   return {
     ...(options.envs ? { env: options.envs } : {}),
-    ...(options.name ? { name: options.name } : {}),
+    name: options.name || uniqueName(),
   }
+}
+
+// Without a name in the create, the platform names the instance after its
+// image or template and adds a random suffix. Creates that arrive at the same
+// time can get the same suffix, and then all but one fail with "An instance
+// with the name ... already exists". So the provider names each sandbox
+// itself: a random part for each process, then a counter.
+const namePrefix = `sandbox-${randomBytes(4).toString('hex')}-`
+let nameCount = 0
+function uniqueName(): string {
+  return namePrefix + (nameCount++).toString(36)
 }
 
 async function createFromSnapshot(
