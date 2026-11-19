@@ -60,6 +60,26 @@ export interface UnikraftConfig {
    * only for a host that answers HTTP/2.
    */
   maxConnections?: number
+  /**
+   * Run the HTTP/2 session to the API host in a worker thread of the SDK, so
+   * that the main thread only posts each request. Off by default;
+   * `UKC_HTTP2_WORKER=1` turns it on when the config does not set it. Set it
+   * only for a host that answers HTTP/2.
+   */
+  http2Worker?: boolean
+  /**
+   * Open the connection to the API host when the provider makes its client,
+   * not at the first request. Off by default; `UKC_PRECONNECT=1` turns it on
+   * when the config does not set it. With `UKC_PRECONNECT` and `UKC_TOKEN` in
+   * the environment, the provider makes the client when this module loads.
+   */
+  preconnect?: boolean
+  /**
+   * The most sandbox creates that the SDK starts in each millisecond; the
+   * other creates of a burst wait for the next one. No limit by default;
+   * `UKC_MAX_CREATES_PER_MS` sets one when the config does not.
+   */
+  maxCreatesPerMs?: number
 }
 
 // `timeout(1)` exits with 124 when it stops a command, so callers that check
@@ -109,7 +129,9 @@ function count(name: string): number | undefined {
 // request on HTTP/1.1, and Node runs every handshake on its one thread. With
 // HTTP/2 the same burst shares a few connections. Both stay off here, because
 // a host that answers only HTTP/1.1 runs at most `maxConnections` requests at
-// once under a cap; a caller on an HTTP/2 host turns them on.
+// once under a cap; a caller on an HTTP/2 host turns them on. The worker
+// thread, the early connection and the create pace stay off for the same
+// reason: they are for a burst on an HTTP/2 host.
 
 function getClient(config: UnikraftConfig): MetroClient {
   const token = config.token ?? env('UKC_TOKEN')
@@ -124,7 +146,10 @@ function getClient(config: UnikraftConfig): MetroClient {
   const metro = config.metro ?? env('UKC_METRO') ?? DEFAULT_METRO
   const http2 = config.http2 ?? flag('UKC_HTTP2') ?? false
   const maxConnections = config.maxConnections ?? count('UKC_MAX_CONNECTIONS') ?? 0
-  const key = JSON.stringify([token, metro, http2, maxConnections])
+  const http2Worker = config.http2Worker ?? flag('UKC_HTTP2_WORKER') ?? false
+  const preconnect = config.preconnect ?? flag('UKC_PRECONNECT') ?? false
+  const maxCreatesPerMs = config.maxCreatesPerMs ?? count('UKC_MAX_CREATES_PER_MS') ?? 0
+  const key = JSON.stringify([token, metro, http2, maxConnections, http2Worker, preconnect, maxCreatesPerMs])
   let client = clients.get(key)
   if (!client) {
     // A URL as the metro pins the client to that deployment, and `metro()`
@@ -134,6 +159,9 @@ function getClient(config: UnikraftConfig): MetroClient {
       metro,
       http2,
       maxConnections: maxConnections > 0 ? maxConnections : undefined,
+      http2Worker,
+      preconnect,
+      maxCreatesPerMs: maxCreatesPerMs > 0 ? maxCreatesPerMs : undefined,
     }).metro(metro)
     clients.set(key, client)
   }
@@ -522,5 +550,20 @@ export const unikraft = defineProvider<Sandbox, UnikraftConfig>({
     },
   },
 })
+
+// The first `unikraft()` call is the earliest point where the provider gets a
+// config, and a caller can make that call a moment before its first create.
+// A process that sets `UKC_PRECONNECT` wants the connection up before then.
+// So with the token in the environment too, the module makes the shared
+// client when it loads, and a later call with the same options gets that
+// client. The import must never fail for this: the first create makes the
+// client again and reports the error.
+if (flag('UKC_PRECONNECT') && env('UKC_TOKEN')) {
+  try {
+    getClient({})
+  } catch {
+    // Left to the first create.
+  }
+}
 
 export default unikraft
